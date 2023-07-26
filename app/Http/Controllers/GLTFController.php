@@ -13,7 +13,114 @@ class GLTFController extends Controller
     private const TIMESTAMP_MAX_LENGTH = 10;
     private const TIMESTAMP_VALIDITY_MAX_LENGTH = 5;
     private const SHFL_MATRIX_SIZE = 6 * 5;
-    private const ENCRYPTED_FILES_PATH = 'encrypted';
+
+    private function num2b60($num)
+    {
+        $base60Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+        $num = $num % 60; // Wrap the number within the range of 0 to 59
+
+        if ($num >= 0 && $num <= 59) {
+            if ($num >= 52) {
+                return $base60Chars[$num - 52 + 50];
+            } elseif ($num >= 26) {
+                return $base60Chars[$num - 26 + 26];
+            } else {
+                return $base60Chars[$num];
+            }
+        } else {
+            // Report an error for numbers outside the valid range
+            throw new \Exception('Error: BASE60 encoder received number out of range: ' . $num);
+        }
+    }
+
+    private function b602num($char)
+    {
+        $base60Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+        $num = strpos($base60Chars, $char);
+        if ($num === false) {
+            echo 'Error: Invalid BASE60 character: ' . $char;
+            return -1;
+        }
+        return $num;
+    }
+
+    public function showUploadForm()
+    {
+        return view('upload');
+    }
+
+    public function showDecryptForm()
+    {
+        return view('decrypt');
+    }
+
+
+    public function decrypt(Request $request)
+    {
+        // Check if the request has a file
+        if ($request->hasFile('encrypted_gltf_file') && $request->has('token')) {
+            $encryptedFile = $request->file('encrypted_gltf_file');
+            $token = $request->input('token');
+
+            // Validate the file and token (You can add more validation here if needed)
+            $validated = $request->validate([
+                'encrypted_gltf_file' => 'file',
+                'token' => 'required|string',
+            ]);
+
+            // Read the content of the encrypted GLTF file
+            $encryptedContent = file_get_contents($encryptedFile->getPathname());
+
+            // Decode the GLTF file and token
+            list($decodedGltf, $decryptedKey, $decryptedUID, $decryptedTimestamp, $decryptedValidity) = $this->decodeGltfAndToken($encryptedContent, $token);
+
+            // Return the decrypted GLTF and other decoded information
+            return response()->json([
+                'decoded_gltf' => $decodedGltf,
+                'decrypted_key' => $decryptedKey,
+                'decrypted_uid' => $decryptedUID,
+                'decrypted_timestamp' => $decryptedTimestamp,
+                'decrypted_validity' => $decryptedValidity,
+            ]);
+        }
+
+        // If the file or token is missing or validation fails, return an error response
+        return response()->json(['error' => 'Invalid file or token'], 400);
+    }
+
+    public function encrypt(Request $request)
+    {
+        // Check if the request has a file
+        if ($request->hasFile('gltf_file')) {
+            $file = $request->file('gltf_file');
+
+            // Validate the file (You can add more validation here if needed)
+            $validated = $request->validate([
+                'gltf_file' => 'file',
+            ]);
+
+            // Encrypt the file and generate token
+            list($encodedGltf, $generatedToken) = $this->encodeAndGenerateToken($file);
+
+            // Save the encoded GLTF to the disk
+            $encodedFilepath = Str::beforeLast($file->getClientOriginalName(), '.gltf') . "_encoded.gltf";
+            Storage::disk('local')->put($encodedFilepath, $encodedGltf);
+
+            // Save the token to the disk
+            $tokenFilepath = Str::beforeLast($file->getClientOriginalName(), '.gltf') . '_token.txt';
+            Storage::disk('local')->put($tokenFilepath, $generatedToken);
+
+            return response()->json([
+                'encoded_path' => Storage::url($encodedFilepath),
+                'token_path' => Storage::url($tokenFilepath),
+            ]);
+        }
+
+        // If no file is uploaded or validation fails, return an error response
+        return response()->json(['error' => 'Invalid file'], 400);
+    }
+
 
     public function upload(Request $request)
     {
@@ -21,149 +128,48 @@ class GLTFController extends Controller
         if ($request->hasFile('gltf_file')) {
             $file = $request->file('gltf_file');
 
-            // Validate the file
+            // Validate the file (You can add more validation here if needed)
             $validated = $request->validate([
                 'gltf_file' => 'file',
             ]);
 
-            // Encrypt the file
-            $encryptedPath = $this->encryptGLTFFile($file);
+            // Generate the UID, USHF, and TIMESTAMP_VALIDITY for token generation
+            $uid = mt_rand(0, 9999999999);
+            $ushf = range(0, 59);
+            shuffle($ushf);
+            $tsv = 10;
 
-            // Return the encrypted file path for further processing
-            return response()->json(['encrypted_path' => $encryptedPath]);
+            // Generate the token
+            $generatedToken = $this->generateToken($uid, $ushf, $tsv);
+
+            // Read the content of the GLTF file
+            $originalGltf = file_get_contents($file->getPathname());
+            $decodedGltf = json_decode($originalGltf, true);
+
+            // Encode the GLTF file and generate the encoded GLTF
+            $encodedGltf = $this->encodeGLTF($decodedGltf, $generatedToken, $ushf);
+
+            // Save the encoded GLTF to the disk
+            $encodedFilepath = Str::beforeLast($file->getClientOriginalName(), '.gltf') . "_encoded.gltf";
+            Storage::disk('local')->put($encodedFilepath, $encodedGltf);
+
+            // Save the token to the disk
+            $tokenFilepath = Str::beforeLast($file->getClientOriginalName(), '.gltf') . '_token.txt';
+            Storage::disk('local')->put($tokenFilepath, $generatedToken);
+
+            return response()->json([
+                'encoded_path' => Storage::url($encodedFilepath),
+                'token_path' => Storage::url($tokenFilepath),
+            ]);
         }
 
         // If no file is uploaded or validation fails, return an error response
         return response()->json(['error' => 'Invalid file'], 400);
     }
-
-    public function decrypt(Request $request)
-{
-    $encryptedFilePath = $request->input('encrypted_file');
-
-    // Decrypt the file
-    $decryptedContents = $this->decryptGLTFFile($encryptedFilePath);
-
-    // Generate a random file name for the decrypted file
-    $decryptedFileName = Str::random(10) . '.gltf';
-
-    // Store the decrypted file in a temporary directory
-    $tempPath = sys_get_temp_dir() . '/' . $decryptedFileName;
-    file_put_contents($tempPath, $decryptedContents);
-
-    // Initiate a file download for the decrypted file
-    return response()->streamDownload(function () use ($tempPath) {
-        echo file_get_contents($tempPath);
-        unlink($tempPath); // Delete the temporary file after sending the response
-    }, $decryptedFileName);
-}
-    private function encryptGLTFFile($file)
+    // Function to generate the token and encode GLTF
+    private function generateToken($uid, $ushf, $tsv)
     {
-        // Generate a random file name for the encrypted GLTF file
-        $encryptedFileName = Str::random(10) . '.gltf';
-
-        // Get the contents of the GLTF file
-        $gltfContents = file_get_contents($file->path());
-
-        // Encrypt the GLTF file contents (replace this with your encryption logic)
-        $encryptedContents = encrypt($gltfContents);
-
-        // Store the encrypted file in the desired location
-        Storage::disk('public')->put(self::ENCRYPTED_FILES_PATH . '/' . $encryptedFileName, $encryptedContents);
-
-        // Return the path of the encrypted file for further processing
-        return self::ENCRYPTED_FILES_PATH . '/' . $encryptedFileName;
-    }
-
-    private function decryptGLTFFile($encryptedFilePath)
-    {
-        // Get the encrypted file contents
-        $encryptedContents = Storage::disk('public')->get($encryptedFilePath);
-
-        // Decrypt the file contents (replace this with your decryption logic)
-        $decryptedContents = decrypt($encryptedContents);
-
-        return $decryptedContents;
-    }
-
-    private function decodeGltfAndToken($egltf, $etkn)
-    {
-        // Copy-pasted offset extracting block from the encoder function. One source of truth.
-        $headerLength = self::UID_MAX_LENGTH + self::USHF_MAX_LENGTH + self::TIMESTAMP_MAX_LENGTH + self::TIMESTAMP_VALIDITY_MAX_LENGTH;
-        $unshOffsetList = [];
-        for ($i = 0; $i < self::USHF_MAX_LENGTH; $i++) {
-            $unshOffset = $this->b602num($etkn[$headerLength + $this->b602num($etkn[$i + self::UID_MAX_LENGTH])]) % 30;
-            $unshOffsetList[] = $unshOffset;
-        }
-
-        // Transcribe data from encoded GLTF into a matrix form.
-        $unshMatrix = [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]];
-        for ($i = 0; $i < 3; $i++) {
-            $encVal = substr(strval($egltf["accessors"][0]["max"][$i]), -6, -1);
-            for ($j = 0; $j < 5; $j++) {
-                $unshMatrix[$i][$j] = intval($encVal[$j]);
-            }
-        }
-        for ($i = 0; $i < 3; $i++) {
-            $encVal = substr(strval($egltf["accessors"][0]["min"][$i]), -6, -1);
-            for ($j = 0; $j < 5; $j++) {
-                $unshMatrix[$i + 3][$j] = intval($encVal[$j]);
-            }
-        }
-
-        // Extract matrix shuffling offsets from token and reconstruct the missing key value.
-        $decKey = '';
-        foreach ($unshOffsetList as $offset) {
-            $decKey .= strval($unshMatrix[intdiv($offset, 5)][($offset % 5)]);
-        }
-        $decKey = strval(intval($decKey));
-
-        // Decode user ID.
-        $decUID = '';
-        for ($i = 0; $i < self::UID_MAX_LENGTH; $i++) {
-            $uidDec = strval($this->b602num($etkn[$headerLength + $this->b602num($etkn[$i])]) % 10);
-            $decUID .= $uidDec;
-        }
-        $decUID = strval(intval(strrev($decUID)));
-
-        // Decode UNIX timestamp.
-        $decTstp = '';
-        for ($i = 0; $i < self::TIMESTAMP_MAX_LENGTH; $i++) {
-            $tstpDec = strval($this->b602num($etkn[$headerLength + $this->b602num($etkn[$i + self::UID_MAX_LENGTH + self::USHF_MAX_LENGTH])]) % 10);
-            $decTstp .= $tstpDec;
-        }
-        $decTstp = strval(intval(strrev($decTstp)));
-
-        // Decode UNIX timestamp validity interval.
-        $decTstpVal = '';
-        for ($i = 0; $i < self::TIMESTAMP_VALIDITY_MAX_LENGTH; $i++) {
-            $tstpValDec = strval($this->b602num($etkn[$headerLength + $this->b602num($etkn[$i + self::UID_MAX_LENGTH + self::USHF_MAX_LENGTH + self::TIMESTAMP_MAX_LENGTH])]) % 10);
-            $decTstpVal .= $tstpValDec;
-        }
-        $decTstpVal = strval(intval(strrev($decTstpVal)));
-
-        // Write decoded hidden key where it belongs.
-        $decGltf = $egltf;
-        $decGltf["accessors"][0]["count"] = intval($decKey);
-        $decGltf["accessors"][1]["count"] = intval($decKey);
-        $decGltf["accessors"][2]["count"] = intval($decKey);
-
-        return [json_encode($decGltf), $decKey, $decUID, $decTstp, $decTstpVal];
-    }
-
-    private function encodeAndGenerateToken($sgltf, $uid, $ushf, $tsv)
-    {
-        // Token generation ----------------------------------------------------------------------------
-
-        // Token is a string 96 characters long containing BASE60 symbols.
-
-        // We use custom BASE60 encoding because we decided that token payload will have 60 ASCII symbols in it,
-        // and that we will record meaningful positions of those in the form of same-base ASCII symbols inside
-        // the token header at its beginning.
-        // Thus token will be 35 + 60 BASE60 ASCII characters long (if we assume that we will need 35 meaningful
-        // positions in the payload, so the same number of index offset symbols inside the header is necessary).
-        // We actually add yet another blank to the end to make token 96 characters long, for obfuscating purposes.
-        // Some of the payload symbols are meaningful such as UID decimals, the rest is filled with random garbage.
+        // Token generation
         $token = '';
 
         // UNIX timestamp as 10-decimal int seconds.
@@ -178,21 +184,21 @@ class GLTFController extends Controller
         $idxs = array_rand(range(0, 59), $headerLength);
 
         // Write indexes of meaningful BASE60 symbols of the token payload area into the token header.
-        foreach ($idxs as $idx) {
-            $token .= $this->num2b60($idx);
+        for ($i = 0; $i < count($idxs); $i++) {
+            $token .= $this->num2b60($idxs[$i]);
         }
 
-        // Fill the token payload with blanks. Token payload is 60 ASCII characters long. We do this because
-        // we need positions in the token string to exist in order to replace them with symbols later.
+        // Fill the token payload with blanks. Token payload is 60 ASCII characters long. We do this bcs
+        // we need positions in the token string to exist to replace them with symbols later.
         // There are other more elegant ways for filling the payload, but this one is quite simple.
-        // Remember that we add yet another blank at the end to make token 96 characters long, thus "61".
+        // Remember that we add yet another blank at the end to make the token 96 characters long, thus "61".
         $token .= str_repeat('.', 61);
 
         // Write symbols representing UID decimals one by one into formerly randomly chosen positions.
         $uidTemp = str_pad($uid, self::UID_MAX_LENGTH, '0', STR_PAD_LEFT);
         for ($i = 0; $i < self::UID_MAX_LENGTH; $i++) {
             $newToken = substr($token, 0, $headerLength + $idxs[$i]);
-            $newToken .= $this->num2b60(intval(substr($uidTemp, -1)) + (random_int(0, 5) * 10));
+            $newToken .= $this->num2b60((int) substr($uidTemp, -1) + (random_int(0, 5) * 10));
             $newToken .= substr($token, $headerLength + $idxs[$i] + 1);
             $token = $newToken;
             $uidTemp = substr($uidTemp, 0, -1);
@@ -203,17 +209,17 @@ class GLTFController extends Controller
         $idxOffset = self::UID_MAX_LENGTH;
         for ($i = 0; $i < self::USHF_MAX_LENGTH; $i++) {
             $newToken = substr($token, 0, $headerLength + $idxs[$i + $idxOffset]);
-            $newToken .= $this->num2b60(intval($ushf[self::USHF_MAX_LENGTH - $i - 1]) + (random_int(0, 1) * 30));
+            $newToken .= $this->num2b60((int) ($ushf[self::USHF_MAX_LENGTH - $i - 1]) + (random_int(0, 1) * 30));
             $newToken .= substr($token, $headerLength + $idxs[$i + $idxOffset] + 1);
             $token = $newToken;
         }
 
         // Write symbols representing Timestamp decimals.
         $idxOffset += self::USHF_MAX_LENGTH;
-        $thisMomentTemp = strval($thisMoment);
+        $thisMomentTemp = (string) $thisMoment;
         for ($i = 0; $i < self::TIMESTAMP_MAX_LENGTH; $i++) {
             $newToken = substr($token, 0, $headerLength + $idxs[$i + $idxOffset]);
-            $newToken .= $this->num2b60(intval(substr($thisMomentTemp, -1)) + (random_int(0, 5) * 10));
+            $newToken .= $this->num2b60((int) substr($thisMomentTemp, -1) + (random_int(0, 5) * 10));
             $newToken .= substr($token, $headerLength + $idxs[$i + $idxOffset] + 1);
             $token = $newToken;
             $thisMomentTemp = substr($thisMomentTemp, 0, -1);
@@ -224,13 +230,13 @@ class GLTFController extends Controller
         $tsvTemp = str_pad($tsv, self::TIMESTAMP_VALIDITY_MAX_LENGTH, '0', STR_PAD_LEFT);
         for ($i = 0; $i < self::TIMESTAMP_VALIDITY_MAX_LENGTH; $i++) {
             $newToken = substr($token, 0, $headerLength + $idxs[$i + $idxOffset]);
-            $newToken .= $this->num2b60(intval(substr($tsvTemp, -1)) + (random_int(0, 5) * 10));
+            $newToken .= $this->num2b60((int) substr($tsvTemp, -1) + (random_int(0, 5) * 10));
             $newToken .= substr($token, $headerLength + $idxs[$i + $idxOffset] + 1);
             $token = $newToken;
             $tsvTemp = substr($tsvTemp, 0, -1);
         }
 
-        // Fill the remaining blank spaces with randomly generated BASE60 symbols.
+        // Fill the remaining blank spaces with random-generated BASE60 symbols.
         for ($i = $headerLength; $i < strlen($token); $i++) {
             if ($token[$i] == '.') {
                 $newToken = substr($token, 0, $i);
@@ -240,129 +246,181 @@ class GLTFController extends Controller
             }
         }
 
-        // GLTF encoding -------------------------------------------------------------------------------
+        return $token;
+    }
 
-        // Encoded GLTF file has crucial int numerical values deleted. Those digits are shuffled and written
-        // in matrix form, embedded into least significant digits of several nearby float point arrays.
-        // Shuffling sequence is carried in a token; it can be kept constant with respect to user ID, or random.
+    private function encodeGLTF($sgltf, $token, $ushf)
+    {
+        // Construct empty shuffling matrix. It has 6 rows and 5 columns.
+        $shMat = [];
+        for ($row = 0; $row < 6; $row++) {
+            $shMat[] = array_fill(0, 5, 0);
+        }
 
-        // Construct empty shuffling matrix. It has 6 rows and 5 columns. In basic non-NumPy Python we can use
-        // a 1-D list of 1-D lists. This lack of typical scientific/numeric notation is a consequence of the fact
-        // that Python had been conceived as a handy text-processing tool. In other programming languages different
-        // notations might be more appropriate and easier to use.
-        $shMat = [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]];
-
-        // Fill empty leading spaces in data shorter than max length with zeros. Decoder must spot those zeros in matrix.
-        $sEncKey = str_pad($sgltf["accessors"][0]["count"], self::USHF_MAX_LENGTH, '0', STR_PAD_LEFT);
+        // Fill unused spaces in the shuffling matrix with random decimals.
+        $shOffsetList = [];
+        for ($i = 0; $i < self::SHFL_MATRIX_SIZE; $i++) {
+            if (!in_array($i, $ushf)) {
+                $shMat[$i / 5][$i % 5] = random_int(0, 9);
+            }
+        }
 
         // Write hidden key digits into the shuffling matrix.
-        $shOffsetList = [];
+        $shOffsetList = array_reverse($ushf);
         for ($i = 0; $i < self::USHF_MAX_LENGTH; $i++) {
-            $shOffset = $this->b602num($token[$headerLength + $this->b602num($token[$i + self::UID_MAX_LENGTH])]) % 30;
-            $shOffsetList[] = $shOffset;
-            $shMat[intdiv($shOffset, 5)][($shOffset % 5)] = intval($sEncKey[$i]);
+            $shOffset = $this->b602num($token[self::UID_MAX_LENGTH + $this->b602num($token[$i])]) % 30;
+            $shMat[(int) ($shOffset / 5)][$shOffset % 5] = (int) substr($sgltf["accessors"][0]["count"], $i, 1);
         }
 
-        // Observe the sequence in which hidden key digits are written into the matrix: First value in shuffling sequence
-        // encodes place in which to write the least significant hidden key digit, second value from the sequence encodes
-        // place for next-to-last hidden key digit and so on.
-        //
-        // In other words, think of decimals as being written in reverse in comparison to left-to-right human-readable order.
-        // For consistency reasons, we write shuffling values in reverse too, i.e value at last index in shfSeq[] goes first.
-        // 
-        // For example, if encKey = 1234 and shMat = [15, 2, 19, 7], then the last digit 4 will be written to matrix location
-        // 15 i.e. 2nd column, 1st row, next-to-last digit 3 will be written to matrix location 2, etc.
-        // Why reverse? Because we will read those digits starting from the back later. Check the decoding algorithm.
-        $encMat = '';
+        // Convert shuffling matrix into a string representation.
+        $shuffledDigits = '';
+        foreach ($shMat as $row) {
+            foreach ($row as $digit) {
+                $shuffledDigits .= (string) $digit;
+            }
+        }
+
+        // Construct encoded version of the original GLTF file by swapping some least important digits in two float fields.
+        $egltf = $sgltf;
+
+        // Delete key values from source GLTF.
+        $egltf["accessors"][0]["count"] = 1;
+        $egltf["accessors"][1]["count"] = 1;
+        $egltf["accessors"][2]["count"] = 1;
+
         for ($i = 0; $i < 3; $i++) {
-            $encMat .= substr($shMat[$i], 0, 5);
-        }
-        for ($i = 3; $i < 6; $i++) {
-            $encMat .= substr($shMat[$i], 0, 5);
+            $sVal = (string) $sgltf["accessors"][0]["max"][$i];
+            $sEncVal = substr($sVal, 0, -6) . substr($shuffledDigits, $i * 5, 5) . substr($sVal, -1);
+            $egltf["accessors"][0]["max"][$i] = (float) $sEncVal;
         }
 
-        // Reconstruct the missing hidden key and check if it has been read correctly.
-        $recKey = '';
-        foreach ($shOffsetList as $offset) {
-            $recKey .= strval($shMat[intdiv($offset, 5)][($offset % 5)]);
+        for ($i = 0; $i < 3; $i++) {
+            $sVal = (string) $sgltf["accessors"][0]["min"][$i];
+            $sEncVal = substr($sVal, 0, -6) . substr($shuffledDigits, ($i + 3) * 5, 5) . substr($sVal, -1);
+            $egltf["accessors"][0]["min"][$i] = (float) $sEncVal;
         }
-        $recKey = strval(intval($recKey));
 
-        // Return the encoded GLTF, token, and reconstructed key.
-        $sgltf["accessors"][0]["count"] = $encMat;
-        $sgltf["accessors"][1]["count"] = $encMat;
-        $sgltf["accessors"][2]["count"] = $encMat;
+        // Convert PHP structure to JSON (GLTF).
+        $egltf = json_encode($egltf);
 
-        return [json_encode($sgltf), $token, $recKey];
+        return $egltf;
     }
+    // Calculate numerical value of a BASE60 symbol.
 
-    private function b602num($x)
+    // Decode GLTF and Token
+    function decodeGltfAndToken($egltf, $etkn)
     {
-        // A - Z  (26 chars),  a - z  (26 chars),  0 - 9 (10 chars)
-        // BASE60 encoding, with slight modification.
-        // Treat letters and numbers as ASCII codes minus 10 or 65
-        // Thus, there is no need for character encoding/decoding,
-        // and this part of the code is very fast in Python.
-        $xNum = ord($x);
-        if ($xNum < 58) {
-            $xNum -= 48;
-        } elseif ($xNum < 91) {
-            $xNum -= 55;
-        } else {
-            $xNum -= 61;
+
+        function b602num($asc)
+        {
+            if (!preg_match('/^[A-Za-z0-9]+$/', $asc)) {
+                // BASE60 decoder received symbol out of range
+                return false;
+            }
+
+            $num = ord($asc);
+            if ($num >= 97) {
+                return $num - 97 + 26;
+            } else if ($num >= 65) {
+                return $num - 65;
+            } else {
+                return $num - 50 + 52;
+            }
+        }
+        $UID_MAX_LENGTH = 10;
+        $USHF_MAX_LENGTH = 10;
+        $TIMESTAMP_MAX_LENGTH = 10;
+        $TIMESTAMP_VALIDITY_MAX_LENGTH = 5;
+
+        // Copy-pasted offset extracting block from the encoder function. One source of truth.
+        $headerLength = $UID_MAX_LENGTH + $USHF_MAX_LENGTH + $TIMESTAMP_MAX_LENGTH + $TIMESTAMP_VALIDITY_MAX_LENGTH;
+        $unshOffsetList = [];
+        for ($i = 0; $i < $USHF_MAX_LENGTH; $i++) {
+            $unshOffset = b602num($etkn[$headerLength + b602num($etkn[$i + $UID_MAX_LENGTH])]) % 30;
+            $unshOffsetList[] = $unshOffset;
         }
 
-        return $xNum;
-    }
+        // Transcribe data from encoded GLTF into a matrix form.
 
-    private function num2b60($x)
-    {
-        // Reverse of the function above.
-        $x = intval($x);
-        if ($x < 10) {
-            $x += 48;
-        } elseif ($x < 36) {
-            $x += 55;
-        } else {
-            $x += 61;
+        // ... (previous code remains unchanged)
+
+        // Transcribe data from encoded GLTF into a matrix form.
+        $unshMatrix = array(
+            array(0, 0, 0, 0, 0),
+            array(0, 0, 0, 0, 0),
+            array(0, 0, 0, 0, 0),
+            array(0, 0, 0, 0, 0),
+            array(0, 0, 0, 0, 0),
+            array(0, 0, 0, 0, 0),
+        );
+
+        for ($i = 0; $i < 3; $i++) {
+            $encVal = mb_substr($egltf["accessors"][0]["max"][$i], -6, 5);
+            $chars = str_split($encVal);
+            for ($j = 0; $j < 5; $j++) {
+                $unshMatrix[$i][$j] = intval($chars[$j]);
+            }
+        }
+        for ($i = 0; $i < 3; $i++) {
+            $encVal = mb_substr($egltf["accessors"][0]["min"][$i], -6, 5);
+            $chars = str_split($encVal);
+            for ($j = 0; $j < 5; $j++) {
+                $unshMatrix[$i + 3][$j] = intval($chars[$j]);
+            }
         }
 
-        return chr($x);
-    }
+        for ($i = 0; $i < 3; $i++) {
+            $encVal = substr($egltf["accessors"][0]["min"][$i], -6, 5);
+            for ($j = 0; $j < 5; $j++) {
+                $unshMatrix[$i + 3][$j] = $encVal[$j];
+            }
+        }
 
-    public function decode(Request $request)
-    {
-        $egltf = json_decode($request->input('egltf'), true);
-        $etkn = $request->input('etkn');
+        // Extract matrix shuffling offsets from token and reconstruct the missing key value.
+        $decKey = '';
+        foreach ($unshOffsetList as $offset) {
+            $decKey .= $unshMatrix[(int) ($offset / 5)][(int) ($offset % 5)];
+        }
+        $decKey = (string) (int) $decKey;
 
-        [$decGltf, $decKey, $decUID, $decTstp, $decTstpVal] = $this->decodeGltfAndToken($egltf, $etkn);
+        // Decode user ID.
+        $decUID = '';
+        for ($i = 0; $i < $UID_MAX_LENGTH; $i++) {
+            $uidDec = (string) (b602num($etkn[$headerLength + b602num($etkn[$i])]) % 10);
+            $decUID .= $uidDec;
+        }
+        $decUID = strrev((string) (int) $decUID); // Reverse string and strip leading zeros
 
-        $result = [
-            'decGltf' => $decGltf,
+        // Decode UNIX timestamp.
+        $decTstp = '';
+        for ($i = 0; $i < $TIMESTAMP_MAX_LENGTH; $i++) {
+            $tstpDec = (string) (b602num($etkn[$headerLength + b602num($etkn[$i + $UID_MAX_LENGTH + $USHF_MAX_LENGTH])]) % 10);
+            $decTstp .= $tstpDec;
+        }
+        $decTstp = strrev((string) (int) $decTstp);
+
+        // Decode UNIX timestamp validity interval.
+        $decTstpVal = '';
+        for ($i = 0; $i < $TIMESTAMP_VALIDITY_MAX_LENGTH; $i++) {
+            $tstpValDec = (string) (b602num($etkn[$headerLength + b602num($etkn[$i + $UID_MAX_LENGTH + $USHF_MAX_LENGTH + $TIMESTAMP_MAX_LENGTH])]) % 10);
+            $decTstpVal .= $tstpValDec;
+        }
+        $decTstpVal = strrev((string) (int) $decTstpVal);
+
+        // Write decoded hidden key where it belongs.
+        $decGltf = $egltf;
+        $decGltf["accessors"][0]["count"] = (int) $decKey;
+        $decGltf["accessors"][1]["count"] = (int) $decKey;
+        $decGltf["accessors"][2]["count"] = (int) $decKey;
+
+        return [
+            'decGltf' => json_encode($decGltf),
             'decKey' => $decKey,
             'decUID' => $decUID,
             'decTstp' => $decTstp,
-            'decTstpVal' => $decTstpVal
+            'decTstpVal' => $decTstpVal,
         ];
-
-        return response()->json($result);
     }
 
-    public function encode(Request $request)
-    {
-        $sgltf = json_decode($request->input('sgltf'), true);
-        $uid = $request->input('uid');
-        $ushf = $request->input('ushf');
-        $tsv = $request->input('tsv');
 
-        [$encGltf, $token, $recKey] = $this->encodeAndGenerateToken($sgltf, $uid, $ushf, $tsv);
-
-        $result = [
-            'encGltf' => $encGltf,
-            'token' => $token,
-            'recKey' => $recKey
-        ];
-
-        return response()->json($result);
-    }
 }
